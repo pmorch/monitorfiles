@@ -1,0 +1,277 @@
+#!/usr/bin/perl -w
+use strict;
+
+=head1 monitorFiles
+
+Monitor a set of files for changes and display the changes or execute a command
+when (one of) the files change.
+
+I was suprised I couldn't find something like this that worked reliably!
+
+On linux inotify could've been used but at least that code path would be linux
+specific, and inotify doesn't work everywhere (e.g. over fuse with sshfs)
+
+There are other similar tools out there, and perhaps you want to try them out
+instead / in addition. Here at least is why I still think my monitorFiles has
+merrit compared to them:
+
+=head2 Problems / Bugs / Issues
+
+It does a stat() on each of the files. So if files are changed by a long
+running process, notification could occur before writing is complete. E.g.
+during compilation, notification could occur before compilation completes.
+
+This could be improved by only notifying about a file, when it has been stable
+for t seconds. However, if it is constantly changing, we'd never be notified!
+
+inotifywait (below) does not have this problem.
+
+=head2 Alternatives
+
+=head3 inotifywait
+
+Can be forced to execute an arbitrary command like this:
+
+    inotifywait -m /some/dir -r -e CLOSE_WRITE --format %w%f | \
+    while read f ; do echo "File: $f changed" ; done
+
+On debian, inotifywait is in the inotify-tools package. It does a great job
+when the source of the changes is local. On a sshfs mount, if the change
+originates from localhost it triggers, but if the change originates from a
+process on the remote machine (which it often does for me - e.g. "make),
+inotifywait doesn't trigger.
+
+inotifywait is probably *way* more efficient than monitorFiles is. But I need
+reliability, not efficiency.
+
+inotifywait allows one to listen to the CLOSE_WRITE event, so it doesn't have
+to guess when writing is finished, like monitorFiles does.
+
+=head3 fileschanged
+
+Didn't work every time for me. Especially not over sshfs mounts, but have also
+seen it not work e.g. on my /raid mount (ext3 over mdadm)
+
+=head3 dnotify
+
+Only tracks changes to directories, not files
+
+=head3 gamin ( or less recently, fam )
+
+These are libraries that support this, but I didn't find any command line
+programs that use them
+
+=head3 inotify 
+
+=head iWatch
+
+Didn't seem mature. Insists on a XML command structure, but doesn't e.g. escape
+'"' chars in the -c parameter, so that this fails with a parser error. I want
+reliability!
+
+    iwatch -c 'echo "foo"' foo
+
+=cut
+
+# We could've done this:
+#
+# use lib glob('~/perl/File-Monitor-0.10/lib');
+# use File::Monitor;
+#
+# But it really wasn't that difficult to implement the parts we need. So look
+# at our budget version of File::Monitor below
+
+use File::Basename;
+use Getopt::Long;
+# To sleep for fractions of a second
+use Time::HiRes qw(sleep);
+
+my $script = basename $0;
+
+sub usage {
+    my ($err) = @_;
+    if ($err) {
+        print "*Error*: $err\n";
+    }
+    print <<END;
+$script [ options ] file file...
+
+If any file changes, print that to STDOUT or run a command
+
+Options:
+
+-c, --command <command>
+    Execute command if files change.
+    If the command contains the {} substring <command> will be executed once
+    for each file that has changed, with {} replaced with the name of the
+    changed file.
+    If not, <command> will be executed once if one or more files change.
+-p, --pollinterval <seconds>
+    Check files for changes every <seconds> seconds. Defaults to 1 (s).
+    Must be a multiple of 0.1.
+-f, --file <file>
+    Add files from <file> to the file arguments. One file file name pr. line
+
+If any file changes, run command. Sleep between each test, defaulting to 1 sec.
+
+You can also specify a list of files in the file: list. One file name pr. line.
+END
+    exit 1;
+}
+
+my %options;
+my $getopt = new Getopt::Long::Parser;
+$getopt->configure('gnu_getopt');
+$getopt->getoptions(
+    \%options,
+    'help|h|?',
+    'command|c=s',
+    'pollinterval|p=f',
+    'filelist|f=s',
+    )
+    or die "Couldn't GetOptions";
+
+if ( $options{help} ) {
+    usage();
+}
+
+$options{'pollinterval'} //= 1;
+$options{'pollinterval'} >= 0.1
+    or usage ("$_ must be > 0.1");
+
+my @files = @ARGV;
+
+if ($options{filelist}) {
+    open I, $options{filelist}
+        or die "Couldn't open $options{filelist} for reading";
+    my @list = <I>;
+    close I;
+    chomp @list;
+    push @files, grep { -e $_ } @list;
+    close I;
+}
+
+if (scalar(@files) == 0) {
+    usage("No files found to monitor");
+}
+
+# use Data::Dumper; print Dumper(\@files);
+
+my $monitor = File::Monitor->new();
+
+foreach my $f (@files) {
+    $monitor->watch($f);
+}
+
+$monitor->scan();
+
+sub notify {
+    my (@files) = @_;
+    if ($options{command}) {
+        my $runCommand = sub {
+            print "--- Executing: ", $_[0], " ---\n";
+            system($_[0]);
+            if ($?) {
+                print "  *** FAILED ***\n";
+            } else {
+                print "  --- OK ---\n";
+            }
+        };
+        if ($options{command} =~ /{}/) {
+            foreach my $f (@files) {
+                my $cmd = $options{command};
+                $cmd =~ s/{}/$f/;
+                $runCommand->($cmd);
+            }
+        } else {
+            $runCommand->($options{command});
+        }
+    } else {
+        print "Changed:\n";
+        foreach my $f (@files) {
+            print "\t", $f, "\n";
+        }
+    }
+}
+
+my $settling = File::Monitor->new();
+my $lastPollTime;
+
+while (1) {
+    my @changes = $monitor->scan();
+    if (@changes) {
+        notify(map { $_->name} @changes);
+    }
+    sleep $options{'pollinterval'};
+}
+
+package File::Monitor;
+
+=head1 package File::Monitor
+
+Mimics File::Monitor from CPAN, since it isn't in a debian package. It only
+supports a *very* limited subset of File::Monitor:
+
+    my $monitor = File::Monitor->new();
+    $monitor->watch('/tmp/foobar');
+    # This returns nothing
+    $monitor->scan();
+    # This returns nothing also
+    system('touch /tmp/foobar');
+    my @changes = $monitor->scan();
+    foreach my $c (@changes) {
+        printf "File: %s changed\n", $c->name();
+    }
+
+=cut
+
+sub new {
+    my ($class) = @_;
+    return bless {}, $class;
+}
+
+sub watch {
+    my ($self, $file) = @_;
+    push @{$$self{watchFiles}}, $file;
+}
+
+sub scan {
+    my ($self) = @_;
+    exists $$self{watchFiles}
+        or die "Call watch() first";
+    my @changes;
+    foreach my $f (@{$$self{watchFiles}}) {
+        my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+            $atime,$mtime,$ctime,$blksize,$blocks) = stat($f);
+
+        # If $ctime isn't defined, then possibly the file didn't exist (or it
+        # got deleted or...). It could be because it is being rewritten. Lets
+        # just skip it this time. If it is being rewritten, we'll catch it on
+        # the next scan
+        next
+            unless defined $ctime && defined $mtime;
+
+        my $newestTime = ( $ctime > $mtime ) ? $ctime : $mtime;
+        if ( exists $$self{fileTime}{$f} &&
+             $$self{fileTime}{$f} < $newestTime ) {
+             push @changes, File::Monitor::File->new($f);
+        }
+        $$self{fileTime}{$f} = $newestTime;
+    }
+    return @changes;
+}
+
+package File::Monitor::File;
+
+# Ok, so I haven't investigated the internals of File::Monitor, and so I have
+# no idea if this is the same class/package name it uses for individual changes
+
+sub new {
+    my ($class, $name) = @_;
+    return bless { name => $name }, $class;
+}
+
+sub name {
+    my ($self) = @_;
+    return $$self{name};
+}
