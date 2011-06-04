@@ -47,6 +47,12 @@ Options:
 -p, --pollinterval <seconds>
     Check files for changes every <seconds> seconds. Defaults to 1 (s).
     Must be a multiple of 0.1.
+-s, --settle <seconds>
+    Files must have remained unchanged for this long before we notify about the
+    change. Defaults to undefined meaning notify immediately about changes.
+    Must be a multiple of 0.1.
+    Note: Many file systems only have a timestamp resolution of 1sec (e.g.
+    ext2/3), FAT has a resolution of 2sec.
 -f, --file <file>
     Add files from <file> to the file arguments. One file file name pr. line
 
@@ -66,6 +72,7 @@ $getopt->getoptions(
     'command|c=s',
     'inotify|i',
     'pollinterval|p=f',
+    'settle|s=f',
     'filelist|f=s',
     )
     or die "Couldn't GetOptions";
@@ -75,8 +82,13 @@ if ( $options{help} ) {
 }
 
 $options{'pollinterval'} //= 1;
-$options{'pollinterval'} >= 0.1
-    or usage ("$_ must be > 0.1");
+
+foreach ('pollinterval', 'settle') {
+    next
+        unless defined $options{$_};
+    $options{$_} >= 0.1
+        or usage ("$_ must be > 0.1");
+}
 
 my @files = @ARGV;
 
@@ -95,6 +107,13 @@ if (scalar(@files) == 0) {
 }
 
 # use Data::Dumper; print Dumper(\@files);
+
+# We have a loop. While no files have changed, the loop polls and sleeps
+# $options{pollinterval}. When a file is discovered to have changed, it
+# becomes "settling" - we're waiting for it to settle. If any files are
+# settling, the loop goes around every 100ms and we see if we need to poll
+# again and if any files have finished settling. We notify about files that
+# have finised settling.
 
 sub notify {
     my (@changedFiles) = @_;
