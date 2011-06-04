@@ -111,7 +111,7 @@ sub notify {
         if ($options{command} =~ /{}/) {
             foreach my $f (@changedFiles) {
                 my $cmd = $options{command};
-                $cmd =~ s/{}/$f/;
+                $cmd =~ s/{}/$f/g;
                 $runCommand->($cmd);
             }
         } else {
