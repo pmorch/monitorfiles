@@ -106,6 +106,10 @@ Options:
     for each file that has changed, with {} replaced with the name of the
     changed file.
     If not, <command> will be executed once if one or more files change.
+-i, --inotify
+    Use 'inotify' - linux only. Superior to polling, but only works on linux,
+    and seems to only work if the file is changed by a process local to this
+    machine, so lookout e.g. with remote mounts.
 -p, --pollinterval <seconds>
     Check files for changes every <seconds> seconds. Defaults to 1 (s).
     Must be a multiple of 0.1.
@@ -126,6 +130,7 @@ $getopt->getoptions(
     \%options,
     'help|h|?',
     'command|c=s',
+    'inotify|i',
     'pollinterval|p=f',
     'filelist|f=s',
     )
@@ -157,16 +162,8 @@ if (scalar(@files) == 0) {
 
 # use Data::Dumper; print Dumper(\@files);
 
-my $monitor = File::Monitor->new();
-
-foreach my $f (@files) {
-    $monitor->watch($f);
-}
-
-$monitor->scan();
-
 sub notify {
-    my (@files) = @_;
+    my (@changedFiles) = @_;
     if ($options{command}) {
         my $runCommand = sub {
             print "--- Executing: ", $_[0], " ---\n";
@@ -178,7 +175,7 @@ sub notify {
             }
         };
         if ($options{command} =~ /{}/) {
-            foreach my $f (@files) {
+            foreach my $f (@changedFiles) {
                 my $cmd = $options{command};
                 $cmd =~ s/{}/$f/;
                 $runCommand->($cmd);
@@ -188,7 +185,7 @@ sub notify {
         }
     } else {
         print "Changed:\n";
-        foreach my $f (@files) {
+        foreach my $f (@changedFiles) {
             print "\t", $f, "\n";
         }
     }
@@ -197,12 +194,87 @@ sub notify {
 my $settling = File::Monitor->new();
 my $lastPollTime;
 
-while (1) {
-    my @changes = $monitor->scan();
-    if (@changes) {
-        notify(map { $_->name} @changes);
+sub pollingLoop() {
+    my $monitor = File::Monitor->new();
+
+    foreach my $f (@files) {
+        $monitor->watch($f);
     }
-    sleep $options{'pollinterval'};
+
+    $monitor->scan();
+
+    while (1) {
+        my @changes = $monitor->scan();
+        if (@changes) {
+            notify(map { $_->name} @changes);
+        }
+        sleep $options{'pollinterval'};
+    }
+}
+
+sub inotifyLoop() {
+    # Don't *use* this as that'll fail on other platforms, where Linux::Inotify
+    # doesn't exist. At least let those platforms work without the --inotify
+    # option
+    eval {
+        require Linux::Inotify2;
+    };
+    if ($@) {
+        my $error = $@;
+        chomp $error;
+        die "require Linux::Inotify2 failed. Are you on linux? " .
+            "Do you have that package installed? " .
+            $error;
+    }
+
+    my $inotify = new Linux::Inotify2
+        or die "Unable to create new inotify object: $!";
+
+    # We only care for these events - finished writing file or file has moved.
+    my $mask = Linux::Inotify2->IN_CLOSE_WRITE | Linux::Inotify2->IN_MOVE_SELF;
+
+    foreach (@files) {
+        # create watch
+        $inotify->watch( $_, $mask )
+            or die "watch creation for $_ failed";
+    }
+
+    while () {
+        my @events = $inotify->read;
+        unless ( @events > 0 ) {
+            print "read error: $!";
+            last;
+        }
+
+        # We've seen several events for the same file in the one @events array.
+        # Be sure to only handle them once...
+        my %fileEvents;
+
+        foreach (@events) {
+            $fileEvents{$_->fullname} //= 0;
+            $fileEvents{$_->fullname} |= $_->mask;
+
+        }
+        my @changedFiles;
+        foreach my $f (sort keys %fileEvents) {
+            # printf "name: %s mask %d (%s)\n",
+            #     $f, $fileEvents{$f}, getMaskNames($fileEvents{$f});
+            if ($fileEvents{$f} & Linux::Inotify2->IN_MOVE_SELF) {
+                print "*Warning*: $f was moved - no longer monitoring\n";
+            }
+            if ($fileEvents{$f} & Linux::Inotify2->IN_CLOSE_WRITE) {
+                # print "$f was written to\n";
+                push @changedFiles, $f;
+            }
+        }
+        notify(@changedFiles);
+    }
+}
+
+if ($options{inotify}) {
+    inotifyLoop();
+} else {
+    pollingLoop();
 }
 
 package File::Monitor;
