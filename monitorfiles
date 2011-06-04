@@ -3,73 +3,7 @@ use strict;
 
 =head1 monitorFiles
 
-Monitor a set of files for changes and display the changes or execute a command
-when (one of) the files change.
-
-I was suprised I couldn't find something like this that worked reliably!
-
-On linux inotify could've been used but at least that code path would be linux
-specific, and inotify doesn't work everywhere (e.g. over fuse with sshfs)
-
-There are other similar tools out there, and perhaps you want to try them out
-instead / in addition. Here at least is why I still think my monitorFiles has
-merrit compared to them:
-
-=head2 Problems / Bugs / Issues
-
-It does a stat() on each of the files. So if files are changed by a long
-running process, notification could occur before writing is complete. E.g.
-during compilation, notification could occur before compilation completes.
-
-This could be improved by only notifying about a file, when it has been stable
-for t seconds. However, if it is constantly changing, we'd never be notified!
-
-inotifywait (below) does not have this problem.
-
-=head2 Alternatives
-
-=head3 inotifywait
-
-Can be forced to execute an arbitrary command like this:
-
-    inotifywait -m /some/dir -r -e CLOSE_WRITE --format %w%f | \
-    while read f ; do echo "File: $f changed" ; done
-
-On debian, inotifywait is in the inotify-tools package. It does a great job
-when the source of the changes is local. On a sshfs mount, if the change
-originates from localhost it triggers, but if the change originates from a
-process on the remote machine (which it often does for me - e.g. "make),
-inotifywait doesn't trigger.
-
-inotifywait is probably *way* more efficient than monitorFiles is. But I need
-reliability, not efficiency.
-
-inotifywait allows one to listen to the CLOSE_WRITE event, so it doesn't have
-to guess when writing is finished, like monitorFiles does.
-
-=head3 fileschanged
-
-Didn't work every time for me. Especially not over sshfs mounts, but have also
-seen it not work e.g. on my /raid mount (ext3 over mdadm)
-
-=head3 dnotify
-
-Only tracks changes to directories, not files
-
-=head3 gamin ( or less recently, fam )
-
-These are libraries that support this, but I didn't find any command line
-programs that use them
-
-=head3 inotify 
-
-=head iWatch
-
-Didn't seem mature. Insists on a XML command structure, but doesn't e.g. escape
-'"' chars in the -c parameter, so that this fails with a parser error. I want
-reliability!
-
-    iwatch -c 'echo "foo"' foo
+See README.md for documentation
 
 =cut
 
